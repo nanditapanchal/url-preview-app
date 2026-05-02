@@ -37,7 +37,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
-#Models 
+# --- Models ---
 class UserRegister(BaseModel):
     username: str
     password: str
@@ -56,7 +56,7 @@ class SavedURL(BaseModel):
     saved_at: str
 
 
-# Auth helpers
+# --- Auth helpers ---
 def hash_password(password: str):
     return pwd_context.hash(password)
 
@@ -80,7 +80,39 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-#  Routes 
+# --- Helpers ---
+async def get_screenshot_url(url: str) -> str:
+    """
+    Calls Microlink JSON API to get the real direct screenshot image URL.
+    Falls back to empty string if it fails.
+    """
+    try:
+        api = f"https://api.microlink.io/?url={url}&screenshot=true&meta=false"
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(api)
+            data = resp.json()
+            # Microlink returns: { "data": { "screenshot": { "url": "https://..." } } }
+            screenshot_url = data.get("data", {}).get("screenshot", {}).get("url", "")
+            return screenshot_url
+    except Exception:
+        return ""
+
+async def get_page_title(url: str) -> str:
+    """Fetches the page and extracts <title> tag."""
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+            resp = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            text = resp.text
+            start = text.find("<title>")
+            end = text.find("</title>")
+            if start != -1 and end != -1:
+                return text[start+7:end].strip()[:120]
+    except Exception:
+        pass
+    return url
+
+
+# --- Routes ---
 @app.post("/register")
 async def register(user: UserRegister):
     existing = await db.users.find_one({"username": user.username})
@@ -104,25 +136,12 @@ async def get_preview(data: URLInput, username: str = Depends(get_current_user))
     if not url.startswith("http"):
         url = "https://" + url
 
-    # preview API
-    preview_url = f"https://api.microlink.io/?url={url}&screenshot=true&meta=false&embed=screenshot.url"
-
-    # title
-    title = url
-    try:
-        async with httpx.AsyncClient(timeout=10) as client_http:
-            resp = await client_http.get(url, follow_redirects=True)
-            text = resp.text
-            start = text.find("<title>")
-            end = text.find("</title>")
-            if start != -1 and end != -1:
-                title = text[start+7:end].strip()[:100]
-    except Exception:
-        pass
+    # Run both in sequence (title first, screenshot second)
+    title = await get_page_title(url)
+    preview_url = await get_screenshot_url(url)
 
     saved_at = datetime.utcnow().isoformat()
 
-    # Save to DB
     await db.urls.insert_one({
         "username": username,
         "url": url,
